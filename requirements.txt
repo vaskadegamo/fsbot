@@ -1,2 +1,1 @@
-telethon
-aiohttp
+python-telegram-bot==13.15
