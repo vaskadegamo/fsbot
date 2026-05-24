@@ -1,48 +1,60 @@
 import os
-import asyncio
-from telethon import TelegramClient, events
-from aiohttp import web
+import logging
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-BASE_URL = os.environ["BASE_URL"]   # например, https://mybot.onrender.com
+# Настройки
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BASE_URL = os.environ.get("BASE_URL")
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL")
+FILES_ROOT = os.environ.get("FILES_ROOT", "temp")
 
-bot = TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-app = web.Application()
-file_map = {}
+# Создаем папку для временных файлов
+os.makedirs(FILES_ROOT, exist_ok=True)
 
-async def stream(request):
-    file_id = request.match_info.get('file_id')
-    path = file_map.get(file_id)
-    if not path or not os.path.exists(path):
-        return web.Response(status=404, text="Not found")
-    return web.FileResponse(path)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-app.router.add_get('/file/{file_id}', stream)
+def start(update: Update, context):
+    update.message.reply_text("Send any file (up to 2GB) and I'll give a direct link.")
 
-@bot.on(events.NewMessage(pattern='/start'))
-async def start_handler(e):
-    await e.reply("Send me any file (up to 2GB) - I'll give a direct link.")
+def handle_file(update: Update, context):
+    if not (update.message.document or update.message.video or update.message.audio):
+        return
 
-@bot.on(events.NewMessage(func=lambda e: e.document or e.video or e.audio))
-async def file_handler(e):
-    m = await e.reply("⏳ Uploading...")
-    f = e.document or e.video or e.audio
-    path = f"temp/{e.id}_{f.id}"
-    await bot.download_file(f, path)
-    file_id = str(f.id)
-    file_map[file_id] = path
-    url = f"{BASE_URL}/file/{file_id}"
-    await m.edit(f"✅ Link: {url} (valid 1 hour)")
+    msg = update.message.reply_text("⏳ Processing...")
+    try:
+        file_obj = update.message.document or update.message.video or update.message.audio
+        # Скачиваем файл на сервер
+        file = context.bot.get_file(file_obj.file_id)
+        file_path = os.path.join(FILES_ROOT, f"{file_obj.file_id}")
+        file.download(file_path)
+        # Формируем прямую ссылку
+        public_url = f"{BASE_URL}/file/{file_obj.file_id}"
+        msg.edit_text(f"✅ Link:\n{public_url}")
+    except Exception as e:
+        logger.exception("Error")
+        msg.edit_text(f"❌ {e}")
 
-async def main():
-    await bot.start()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8080)))
-    await site.start()
-    print(f"Bot ready. Web server on {BASE_URL}")
-    await bot.run_until_disconnected()
+def main():
+    bot = Bot(token=BOT_TOKEN)
+    updater = Updater(bot=bot, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.attachment, handle_file))
+    
+    # Используем вебхуки вместо polling для стабильности
+    if WEBHOOK_URL:
+        updater.start_webhook(listen="0.0.0.0", port=int(os.environ.get("PORT", 8080)), url_path=BOT_TOKEN)
+        updater.bot.set_webhook(f"{WEBHOOK_URL}/{BOT_TOKEN}")
+        logger.info(f"Webhook started on {WEBHOOK_URL}")
+    else:
+        updater.start_polling()
+        logger.info("Polling started")
+    
+    updater.idle()
 
-asyncio.run(main())
+if __name__ == '__main__':
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN not set")
+    main()
